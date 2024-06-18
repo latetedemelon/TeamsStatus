@@ -6,6 +6,10 @@ $currentAvailability = $null
 $currentActivity = $null
 $previousAvailability = $null
 $previousActivity = $null
+$currentCalendarStatus = $null
+$previousCalendarStatus = $null
+$currentNextMeeting = $null
+$previousNextMeeting = $null
 $ActivityIcon = $iconNotInACall
 
 function Get-LatestLogFile {
@@ -71,6 +75,52 @@ Function Set-ActivityIcon {
     }
 }
 
+Function Get-CalendarStatus {
+    Add-Type -AssemblyName "Microsoft.Office.Interop.Outlook" | Out-Null
+    $outlook = New-Object -ComObject Outlook.Application
+    $namespace = $outlook.GetNamespace("MAPI")
+    $calendarFolder = $namespace.GetDefaultFolder([Microsoft.Office.Interop.Outlook.OlDefaultFolders]::olFolderCalendar)
+
+    $currentTime = Get-Date
+    $items = $calendarFolder.Items
+    $items.IncludeRecurrences = $true
+    $items.Sort("[Start]")
+
+    $currentMeeting = $null
+    $nextMeeting = $null
+
+    foreach ($item in $items) {
+        if ($item.Start -le $currentTime -and $item.End -gt $currentTime) {
+            if ($item.BusyStatus -eq [Microsoft.Office.Interop.Outlook.OlBusyStatus]::olBusy -or
+                $item.BusyStatus -eq [Microsoft.Office.Interop.Outlook.OlBusyStatus]::olTentative) {
+                $currentMeeting = $item
+                break
+            }
+        } elseif ($item.Start -gt $currentTime) {
+            if ($item.BusyStatus -eq [Microsoft.Office.Interop.Outlook.OlBusyStatus]::olBusy -or
+                $item.BusyStatus -eq [Microsoft.Office.Interop.Outlook.OlBusyStatus]::olTentative) {
+                $nextMeeting = $item
+                break
+            }
+        }
+    }
+
+    if ($currentMeeting) {
+        $script:currentCalendarStatus = "Busy"
+    } else {
+        $script:currentCalendarStatus = "Free"
+    }
+
+    if ($nextMeeting) {
+        $script:currentNextMeeting = $nextMeeting.Start
+    } else {
+        $script:currentNextMeeting = "No upcoming meetings today"
+    }
+
+    Write-Host "Calendar status: $script:currentCalendarStatus"
+    Write-Host "Next meeting: $script:currentNextMeeting"
+}
+
 Function Send-LatestActivity {
     if ($script:currentAvailability -ne $script:previousAvailability) {
         $params = @{
@@ -110,45 +160,67 @@ Function Send-LatestActivity {
         Write-Host "No change in activity, skipping update."
     }
 
-    $script:previousAvailability = $script:currentAvailability
-    $script:previousActivity = $script:currentActivity
-}
-
-while ($true) {
-    $TeamsProcess = Get-Process -Name ms-teams -ErrorAction SilentlyContinue
-
-    if ($null -ne $TeamsProcess) {
-        Write-Host "Microsoft Teams process is running."
-        
-        $latestLogFile = Get-LatestLogFile
-        if ($latestLogFile -ne $null) {
-            $latestAvailabilityEntry = Find-LatestAvailability -logFilePath $latestLogFile
-            if ($latestAvailabilityEntry -ne $null) {
-                Write-Host $latestAvailabilityEntry
-            } else {
-                Write-Host "No availability entry found in the log file."
+    if ($script:currentCalendarStatus -ne $script:previousCalendarStatus) {
+        $params = @{
+            "state" = "$script:currentCalendarStatus";
+            "attributes" = @{
+                "friendly_name" = "$entityCalendarStatusName";
+                "icon" = "mdi:calendar";
             }
-
-            $latestActivityEntry = Find-LatestActivity -logFilePath $latestLogFile
-            if ($latestActivityEntry -ne $null) {
-                Write-Host $latestActivityEntry
-            } else {
-                Write-Host "No activity entry found in the log file."
-            }
-
-            Set-ActivityIcon
-        } else {
-            Write-Host "No log file found."
+        }
+        $params = $params | ConvertTo-Json
+        try {
+            Invoke-RestMethod -Uri "$HAUrl/api/states/$entityCalendarStatus" -Method POST -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($params)) -ContentType "application/json"
+            Write-Host "Successfully updated calendar status to Home Assistant."
+        } catch {
+            Write-Error "Failed to update calendar status to Home Assistant: $_"
         }
     } else {
-        Write-Host "Microsoft Teams process is not running."
-        $script:currentAvailability = "Offline"
-        $script:currentActivity = "Inactive"
-        $script:ActivityIcon = $iconNotInACall
-        Write-Host "Availability set to: $script:currentAvailability"
-        Write-Host "Activity set to: $script:currentActivity"
+        Write-Host "No change in calendar status, skipping update."
     }
 
-    Send-LatestActivity
-    Start-Sleep -Seconds $refreshDelay
+    if ($script:currentNextMeeting -ne $script:previousNextMeeting) {
+        $params = @{
+            "state" = "$script:currentNextMeeting";
+            "attributes" = @{
+                "friendly_name" = "$entityNextMeetingName";
+                "icon" = "mdi:calendar-clock";
+            }
+        }
+        $params = $params | ConvertTo-Json
+        try {
+            Invoke-RestMethod -Uri "$HAUrl/api/states/$entityNextMeeting" -Method POST -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($params)) -ContentType "application/json"
+            Write-Host "Successfully updated next meeting to Home Assistant."
+        } catch {
+            Write-Error "Failed to update next meeting to Home Assistant: $_"
+        }
+    } else {
+        Write-Host "No change in next meeting, skipping update."
+    }
 }
+
+Function Monitor-Teams {
+    while ($Enable) {
+        $latestLogFile = Get-LatestLogFile
+        if ($latestLogFile) {
+            Find-LatestAvailability -logFilePath $latestLogFile
+            Find-LatestActivity -logFilePath $latestLogFile
+            Set-ActivityIcon
+            Get-CalendarStatus
+
+            Send-LatestActivity
+
+            $previousAvailability = $script:currentAvailability
+            $previousActivity = $script:currentActivity
+            $previousCalendarStatus = $script:currentCalendarStatus
+            $previousNextMeeting = $script:currentNextMeeting
+        } else {
+            Write-Host "No log file found. Skipping this iteration."
+        }
+
+        Start-Sleep -Seconds $refreshDelay
+    }
+}
+
+# Start monitoring Teams activity and calendar status
+Monitor-Teams
